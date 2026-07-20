@@ -1,0 +1,1031 @@
+#!/usr/bin/env bash
+
+set -eo pipefail
+
+### COLOR CODES ###
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+CYAN=$(tput setaf 6)
+RESET=$(tput sgr0)
+
+usage() {
+    echo ""
+    echo "Usage: $0 <up|destroy>"
+    echo ""
+    echo "  up       Interactive guided deployment of GCP ZTGW + consumer NSI resources"
+    echo "  destroy  Tear down all resources and clean up state"
+    echo ""
+    exit 1
+}
+
+banner() {
+    echo ""
+    echo "${GREEN}============================================================${RESET}"
+    echo "${GREEN}  Zscaler GCP ZTGW — Interactive Deployment Wrapper${RESET}"
+    echo "${GREEN}============================================================${RESET}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+if [ $# -ne 1 ]; then
+    usage
+else
+    case $1 in
+        up|destroy)
+            oper=$1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# Change to script directory (supports running from any path)
+# ---------------------------------------------------------------------------
+cd "$(dirname "$0")"
+
+banner
+
+# ---------------------------------------------------------------------------
+# OS / architecture detection
+# ---------------------------------------------------------------------------
+
+echo "Detecting OS and architecture..."
+archdetect=$(uname -m)
+tversion=1.9.0
+
+if [[ "$OSTYPE" == "linux"* ]]; then
+    os_str=linux
+    arch=amd64
+    ostype=Linux
+elif [[ "$OSTYPE" == "darwin"* && "$archdetect" == "arm64" ]]; then
+    os_str=darwin
+    arch=arm64
+    ostype=MacOS_arm64
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    os_str=darwin
+    arch=amd64
+    ostype=MacOS
+else
+    echo "${RED}Unsupported OS: $OSTYPE${RESET}"
+    exit 1
+fi
+echo "${GREEN}OS: $ostype | Terraform version: $tversion${RESET}"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Download Terraform binary if not present
+# ---------------------------------------------------------------------------
+
+dir=bin
+if [[ ! -e $dir ]]; then
+    mkdir -p $dir
+fi
+
+if [[ ! -e ./$dir/terraform ]]; then
+    echo "Downloading Terraform $tversion for ${os_str}_${arch}..."
+    curl -so ./$dir/terraform_${tversion}_${arch}.zip \
+        "https://releases.hashicorp.com/terraform/${tversion}/terraform_${tversion}_${os_str}_${arch}.zip"
+    unzip -qo ./$dir/terraform_${tversion}_${arch}.zip -d ./$dir
+    rm -f ./$dir/terraform_${tversion}_${arch}.zip
+    echo "${GREEN}Terraform $tversion downloaded to ./$dir/${RESET}"
+else
+    echo "${GREEN}Terraform binary already present in ./$dir/${RESET}"
+fi
+echo ""
+
+export PATH="${PWD}/bin:${PATH}"
+
+# ---------------------------------------------------------------------------
+# Interactive prompts (only on first run — .zsecrc acts as config cache)
+# ---------------------------------------------------------------------------
+
+if [[ "$oper" == "up" && ! -e ./.zsecrc ]]; then
+
+    # -----------------------------------------------------------------------
+    # Step 1: Deployment mode
+    # -----------------------------------------------------------------------
+    PS3="${CYAN}Select deployment mode: ${RESET}"
+    modes=(
+        "Full deployment — Deploy ZTGW + consumer NSI resources (Recommended)"
+        "ZTGW-only — Deploy ZTGW and output intercept deployment group"
+        "Consumer-only — Connect existing ZTGW to consumer VPC"
+        "Lab Environment — Create GCP test VPCs, VMs, and NSI infrastructure"
+    )
+    select mode_choice in "${modes[@]}"; do
+        case $REPLY in
+            1)
+                echo "${GREEN}Full deployment selected${RESET}"
+                deploy_ztgw=true
+                deploy_consumer=true
+                echo "export TF_VAR_deploy_ztgw=true" >> .zsecrc
+                echo "export TF_VAR_deploy_consumer=true" >> .zsecrc
+                break
+                ;;
+            2)
+                echo "${GREEN}ZTGW-only deployment selected${RESET}"
+                deploy_ztgw=true
+                deploy_consumer=false
+                echo "export TF_VAR_deploy_ztgw=true" >> .zsecrc
+                echo "export TF_VAR_deploy_consumer=false" >> .zsecrc
+                break
+                ;;
+            3)
+                echo "${GREEN}Consumer-only deployment selected${RESET}"
+                deploy_ztgw=false
+                deploy_consumer=true
+                echo "export TF_VAR_deploy_ztgw=false" >> .zsecrc
+                echo "export TF_VAR_deploy_consumer=true" >> .zsecrc
+                break
+                ;;
+            4)
+                echo "${GREEN}Lab Environment selected${RESET}"
+                echo "export LAB_MODE=true" >> .zsecrc
+                LAB_MODE=true
+                break
+                ;;
+            *)
+                echo "${RED}Invalid selection. Enter 1, 2, 3, or 4${RESET}"
+                ;;
+        esac
+    done
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # LAB MODE — complete interactive flow (skips Steps 2-9 for ZTGW/consumer)
+    # -----------------------------------------------------------------------
+    if [[ "$LAB_MODE" == "true" ]]; then
+
+        LAB_TF_DIR="../lab-environment"
+
+        # --- Lab scenario sub-menu ---
+        echo "${YELLOW}--- Lab Scenario ---${RESET}"
+        echo ""
+        PS3="${CYAN}Select lab scenario: ${RESET}"
+        lab_scenarios=(
+            "East-West  — Two VPCs (10.1.0.0/16 + 192.168.0.0/16), nginx VMs, bastion, VPC peering"
+            "Ingress    — One VPC (172.16.0.0/16), web server, external passthrough NLB (L4)"
+            "Both       — Full lab: East-West + Ingress (all three VPCs)"
+        )
+        select lab_choice in "${lab_scenarios[@]}"; do
+            case $REPLY in
+                1)
+                    echo "${GREEN}East-West scenario selected${RESET}"
+                    lab_scenario="east-west"
+                    echo "export LAB_SCENARIO='east-west'" >> .zsecrc
+                    echo "export TF_VAR_deploy_east_west=true" >> .zsecrc
+                    echo "export TF_VAR_deploy_ingress=false" >> .zsecrc
+                    break
+                    ;;
+                2)
+                    echo "${GREEN}Ingress scenario selected${RESET}"
+                    lab_scenario="ingress"
+                    echo "export LAB_SCENARIO='ingress'" >> .zsecrc
+                    echo "export TF_VAR_deploy_east_west=false" >> .zsecrc
+                    echo "export TF_VAR_deploy_ingress=true" >> .zsecrc
+                    break
+                    ;;
+                3)
+                    echo "${GREEN}Both scenarios selected (full lab)${RESET}"
+                    lab_scenario="both"
+                    echo "export LAB_SCENARIO='both'" >> .zsecrc
+                    echo "export TF_VAR_deploy_east_west=true" >> .zsecrc
+                    echo "export TF_VAR_deploy_ingress=true" >> .zsecrc
+                    break
+                    ;;
+                *)
+                    echo "${RED}Invalid selection. Enter 1, 2, or 3${RESET}"
+                    ;;
+            esac
+        done
+        echo ""
+
+        # --- GCP configuration ---
+        echo "${YELLOW}--- GCP Configuration ---${RESET}"
+        echo ""
+
+        while [ -z "$lab_project_id" ]; do
+            read -r -p "${CYAN}Enter GCP project ID: ${RESET}" lab_project_id
+        done
+        echo "export TF_VAR_project_id='$lab_project_id'" >> .zsecrc
+
+        PS3="${CYAN}Select GCP region: ${RESET}"
+        regions=(
+            "us-central1"
+            "us-east1"
+            "us-east4"
+            "us-east5"
+            "us-west1"
+            "us-west2"
+            "us-west3"
+            "us-west4"
+            "asia-south1"
+            "asia-south2"
+            "asia-southeast1"
+            "australia-southeast1"
+            "europe-west1"
+            "europe-west3"
+            "europe-west4"
+        )
+        select region_choice in "${regions[@]}"; do
+            for r in "${regions[@]}"; do
+                if [[ "$r" == "$region_choice" ]]; then
+                    lab_region=$region_choice
+                    echo "${GREEN}Region: $lab_region${RESET}"
+                    echo "export TF_VAR_region='$lab_region'" >> .zsecrc
+                    break 2
+                fi
+            done
+            echo "${RED}Invalid selection${RESET}"
+        done
+
+        lab_zone_default="${lab_region}-a"
+        read -r -p "${CYAN}Enter GCP zone [Default=$lab_zone_default]: ${RESET}" lab_zone_input
+        lab_zone=${lab_zone_input:-$lab_zone_default}
+        echo "export TF_VAR_zone='$lab_zone'" >> .zsecrc
+
+        lab_deploy_key_default="ztgw-lab"
+        read -r -p "${CYAN}Enter naming prefix for all resources [Default=$lab_deploy_key_default]: ${RESET}" lab_deploy_key_input
+        lab_deploy_key=${lab_deploy_key_input:-$lab_deploy_key_default}
+        echo "export TF_VAR_deploy_key='$lab_deploy_key'" >> .zsecrc
+
+        lab_machine_type_default="e2-small"
+        read -r -p "${CYAN}Enter machine type for all VMs [Default=$lab_machine_type_default]: ${RESET}" lab_machine_type_input
+        lab_machine_type=${lab_machine_type_input:-$lab_machine_type_default}
+        echo "export TF_VAR_machine_type='$lab_machine_type'" >> .zsecrc
+        echo ""
+
+        # --- NSI configuration ---
+        echo "${YELLOW}--- NSI Configuration ---${RESET}"
+        echo ""
+        echo "NSI (Network Security Intercept) connects your VPCs to the Zscaler ZTGW"
+        echo "via endpoint groups and firewall policies. You need an intercept_deployment_group"
+        echo "from a deployed ZTGW to enable this."
+        echo ""
+
+        while true; do
+            read -r -p "${CYAN}Do you have a ZTGW intercept_deployment_group to connect NSI now? (yes/no): ${RESET}" lab_nsi_answer
+            case $lab_nsi_answer in
+                yes|y)
+                    lab_deploy_nsi=true
+                    echo "export TF_VAR_deploy_nsi=true" >> .zsecrc
+                    break
+                    ;;
+                no|n)
+                    lab_deploy_nsi=false
+                    echo "export TF_VAR_deploy_nsi=false" >> .zsecrc
+                    echo ""
+                    echo "${YELLOW}NSI will be skipped. VPCs, VMs, bastion, peering, and NLB will be created without NSI.${RESET}"
+                    echo "${YELLOW}Re-run './zsec up' (delete .zsecrc first) with the intercept_deployment_group to add NSI later.${RESET}"
+                    break
+                    ;;
+                *)
+                    echo "${RED}Invalid response. Please enter yes or no${RESET}"
+                    ;;
+            esac
+        done
+        echo ""
+
+        if [[ "$lab_deploy_nsi" == "true" ]]; then
+            # Intercept deployment group
+            while [ -z "$lab_intercept_dg" ]; do
+                read -r -p "${CYAN}Enter intercept deployment group resource ID${RESET}
+${CYAN}(e.g. projects/zscaler-project/locations/global/interceptDeploymentGroups/my-group): ${RESET}" lab_intercept_dg
+            done
+            echo "export TF_VAR_intercept_deployment_group='$lab_intercept_dg'" >> .zsecrc
+            echo ""
+
+            # Security profile scope
+            PS3="${CYAN}Select security profile scope: ${RESET}"
+            scopes=(
+                "Project level (default — recommended)"
+                "Organization level"
+            )
+            select scope_choice in "${scopes[@]}"; do
+                case $REPLY in
+                    1)
+                        lab_scope="project"
+                        echo "${GREEN}Scope: project${RESET}"
+                        echo "export TF_VAR_security_profile_scope='project'" >> .zsecrc
+                        break
+                        ;;
+                    2)
+                        lab_scope="organization"
+                        echo "${GREEN}Scope: organization${RESET}"
+                        echo "export TF_VAR_security_profile_scope='organization'" >> .zsecrc
+
+                        while [ -z "$lab_org_id" ]; do
+                            read -r -p "${CYAN}Enter GCP organization ID: ${RESET}" lab_org_id
+                        done
+                        echo "export TF_VAR_organization_id='$lab_org_id'" >> .zsecrc
+                        break
+                        ;;
+                    *)
+                        echo "${RED}Invalid selection. Enter 1 or 2${RESET}"
+                        ;;
+                esac
+            done
+            echo ""
+        fi
+
+        # --- PATH ---
+        if ! grep -Fxq "export PATH=\${PATH}:\${PWD}/bin" .zsecrc 2>/dev/null; then
+            echo 'export PATH=${PATH}:${PWD}/bin' >> .zsecrc
+        fi
+
+        # --- Lab deployment summary ---
+        echo "${GREEN}============================================================${RESET}"
+        echo "${GREEN}           LAB ENVIRONMENT SUMMARY${RESET}"
+        echo "${GREEN}============================================================${RESET}"
+        echo ""
+
+        case $lab_scenario in
+            east-west)
+                echo "  Scenario:         ${GREEN}East-West${RESET}"
+                ;;
+            ingress)
+                echo "  Scenario:         ${GREEN}Ingress${RESET}"
+                ;;
+            both)
+                echo "  Scenario:         ${GREEN}Both (East-West + Ingress)${RESET}"
+                ;;
+        esac
+
+        echo "  Project:          ${GREEN}$lab_project_id${RESET}"
+        echo "  Region / Zone:    ${GREEN}$lab_region / $lab_zone${RESET}"
+        echo "  Naming Prefix:    ${GREEN}$lab_deploy_key${RESET}"
+        echo "  Machine Type:     ${GREEN}$lab_machine_type${RESET}"
+        echo ""
+
+        if [[ "$lab_scenario" == "east-west" || "$lab_scenario" == "both" ]]; then
+            echo "  ${CYAN}East-West VPCs:${RESET}"
+            echo "    VPC-A:          vpc-ew-a  (10.1.0.0/16 -> subnet 10.1.1.0/24)"
+            echo "    VPC-B:          vpc-ew-b  (192.168.0.0/16 -> subnet 192.168.1.0/24)"
+            echo "    VMs:            vpc-ew-a-nginx, vpc-ew-b-nginx"
+            echo "    Bastion:        ${lab_deploy_key}-bastion (static public IP, SSH key -> lab-key.pem)"
+            echo "    Peering:        vpc-ew-a <-> vpc-ew-b (bi-directional)"
+            if [[ "$lab_deploy_nsi" == "true" ]]; then
+                echo "    NSI:            ${GREEN}ENABLED${RESET} — endpoint groups + firewall policies on both VPCs"
+            else
+                echo "    NSI:            ${YELLOW}SKIPPED${RESET} — deploy later with intercept_deployment_group"
+            fi
+            echo ""
+        fi
+
+        if [[ "$lab_scenario" == "ingress" || "$lab_scenario" == "both" ]]; then
+            echo "  ${CYAN}Ingress VPC:${RESET}"
+            echo "    VPC:            vpc-ingress (172.16.0.0/16 -> subnet 172.16.1.0/24)"
+            echo "    Web server:     vpc-ingress-web-server (nginx)"
+            echo "    NLB:            External passthrough L4 NLB (port 80)"
+            if [[ "$lab_deploy_nsi" == "true" ]]; then
+                echo "    NSI:            ${GREEN}ENABLED${RESET} — endpoint group + firewall policy on ingress VPC"
+            else
+                echo "    NSI:            ${YELLOW}SKIPPED${RESET} — deploy later with intercept_deployment_group"
+            fi
+            echo ""
+        fi
+
+        if [[ "$lab_scenario" == "ingress" && "$lab_scenario" != "both" ]]; then
+            echo "  Bastion:          ${lab_deploy_key}-bastion (in ingress VPC, static public IP)"
+            echo ""
+        fi
+
+        if [[ "$lab_deploy_nsi" == "true" ]]; then
+            echo "  Intercept Group:  ${GREEN}$lab_intercept_dg${RESET}"
+            echo "  Profile Scope:    ${GREEN}${lab_scope}${RESET}"
+            echo ""
+        fi
+
+        echo "${GREEN}============================================================${RESET}"
+        echo ""
+
+        while true; do
+            read -r -p "${CYAN}Proceed with deployment? (yes/no): ${RESET}" proceed
+            case $proceed in
+                yes|y)
+                    echo ""
+                    break
+                    ;;
+                no|n)
+                    echo "${YELLOW}Deployment cancelled. Configuration saved in .zsecrc${RESET}"
+                    echo "${YELLOW}Re-run './zsec up' to deploy with saved configuration, or delete .zsecrc to start over.${RESET}"
+                    exit 0
+                    ;;
+                *)
+                    echo "${RED}Invalid response. Please enter yes or no${RESET}"
+                    ;;
+            esac
+        done
+
+        # --- Source config and deploy ---
+        . ./.zsecrc
+
+        echo "${GREEN}Initializing Terraform (lab-environment)...${RESET}"
+        ./bin/terraform -chdir="$LAB_TF_DIR" init
+
+        echo ""
+        echo "${GREEN}Deploying lab environment...${RESET}"
+
+        if [[ "$AUTO_APPROVE" ]]; then
+            ./bin/terraform -chdir="$LAB_TF_DIR" apply -auto-approve
+        else
+            ./bin/terraform -chdir="$LAB_TF_DIR" apply
+        fi
+
+        echo ""
+        echo "${GREEN}============================================================${RESET}"
+        echo "${GREEN}  Lab Environment deployment complete${RESET}"
+        echo "${GREEN}============================================================${RESET}"
+        echo ""
+        echo "  Run ${CYAN}./bin/terraform -chdir=$LAB_TF_DIR output${RESET} to view all outputs."
+        echo "  Run ${CYAN}./zsec destroy${RESET} to tear down all resources."
+        echo ""
+
+        exit 0
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 2: Zscaler OneAPI credentials (all modes)
+    # -----------------------------------------------------------------------
+    echo "${YELLOW}--- Zscaler OneAPI Authentication ---${RESET}"
+    echo ""
+
+    while [ -z "$client_id" ]; do
+        read -r -p "${CYAN}Enter Zscaler OneAPI Client ID: ${RESET}" client_id
+    done
+    echo "export TF_VAR_client_id='$client_id'" >> .zsecrc
+
+    while [ -z "$client_secret" ]; do
+        read -rs -p "${CYAN}Enter Zscaler OneAPI Client Secret (input hidden): ${RESET}" client_secret
+        echo ""
+    done
+    echo "export TF_VAR_client_secret='$client_secret'" >> .zsecrc
+
+    while [ -z "$vanity_domain" ]; do
+        read -r -p "${CYAN}Enter Zscaler Vanity Domain (e.g. acme): ${RESET}" vanity_domain
+    done
+    echo "export TF_VAR_vanity_domain='$vanity_domain'" >> .zsecrc
+
+    PS3="${CYAN}Select Zscaler cloud: ${RESET}"
+    clouds=("zscaler" "zscalerone" "zscalertwo" "zscalerthree" "zscalerbeta")
+    select cloud_choice in "${clouds[@]}"; do
+        for c in "${clouds[@]}"; do
+            if [[ "$c" == "$cloud_choice" ]]; then
+                cloud=$cloud_choice
+                echo "${GREEN}Cloud: $cloud${RESET}"
+                echo "export TF_VAR_cloud='$cloud'" >> .zsecrc
+                break 2
+            fi
+        done
+        echo "${RED}Invalid selection${RESET}"
+    done
+
+    # Optional login domain override
+    read -r -p "${CYAN}Enter custom login domain if your tenant uses a different one than '${cloud}' default (e.g. zslogin.net) [Enter to use cloud default]: ${RESET}" login_domain_input
+    if [ -n "$login_domain_input" ]; then
+        echo "export TF_VAR_login_domain='$login_domain_input'" >> .zsecrc
+        echo "${GREEN}Using custom login domain: $login_domain_input (instead of cloud default)${RESET}"
+    fi
+    echo ""
+
+    # -----------------------------------------------------------------------
+    # Step 3: ZTGW parameters (full + ZTGW-only modes)
+    # -----------------------------------------------------------------------
+    if [[ "$deploy_ztgw" == "true" ]]; then
+        echo "${YELLOW}--- GCP ZTGW Configuration ---${RESET}"
+        echo ""
+
+        gateway_name_default="gcp-ztgw"
+        read -r -p "${CYAN}Enter ZTGW name [Default=$gateway_name_default]: ${RESET}" gateway_name_input
+        gateway_name=${gateway_name_input:-$gateway_name_default}
+        echo "export TF_VAR_gateway_name='$gateway_name'" >> .zsecrc
+
+        PS3="${CYAN}Select GCP region for ZTGW: ${RESET}"
+        regions=(
+            "us-central1"
+            "us-east1"
+            "us-east4"
+            "us-east5"
+            "us-west1"
+            "us-west2"
+            "us-west3"
+            "us-west4"
+            "asia-south1"
+            "asia-south2"
+            "asia-southeast1"
+            "australia-southeast1"
+            "europe-west1"
+            "europe-west3"
+            "europe-west4"
+        )
+        select region_choice in "${regions[@]}"; do
+            for r in "${regions[@]}"; do
+                if [[ "$r" == "$region_choice" ]]; then
+                    gcp_region=$region_choice
+                    echo "${GREEN}Region: $gcp_region${RESET}"
+                    echo "export TF_VAR_gcp_region='$gcp_region'" >> .zsecrc
+                    break 2
+                fi
+            done
+            echo "${RED}Invalid selection${RESET}"
+        done
+
+        location_name_default="${gateway_name}-location"
+        read -r -p "${CYAN}Enter Zscaler location name [Default=$location_name_default]: ${RESET}" location_name_input
+        location_name=${location_name_input:-$location_name_default}
+        echo "export TF_VAR_location_name='$location_name'" >> .zsecrc
+
+        read -r -p "${CYAN}Enter IAM principal email (optional, press Enter to skip): ${RESET}" iam_principal_email
+        if [ -n "$iam_principal_email" ]; then
+            echo "export TF_VAR_iam_principal_email='$iam_principal_email'" >> .zsecrc
+        fi
+        echo ""
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 4: Intercept deployment group (consumer-only mode)
+    # -----------------------------------------------------------------------
+    if [[ "$deploy_ztgw" == "false" ]]; then
+        echo "${YELLOW}--- Existing ZTGW Intercept Deployment Group ---${RESET}"
+        echo ""
+        while [ -z "$intercept_deployment_group" ]; do
+            read -r -p "${CYAN}Enter intercept deployment group resource ID${RESET}
+${CYAN}(e.g. projects/zscaler-project/locations/global/interceptDeploymentGroups/my-group): ${RESET}" intercept_deployment_group
+        done
+        echo "export TF_VAR_intercept_deployment_group='$intercept_deployment_group'" >> .zsecrc
+        echo ""
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 5-7: Consumer side configuration (full + consumer-only modes)
+    # -----------------------------------------------------------------------
+    if [[ "$deploy_consumer" == "true" ]]; then
+
+        echo "${YELLOW}=== Consumer Side Configuration ===${RESET}"
+        echo ""
+
+        # --- Security Profile Scope ---
+        echo "${YELLOW}--- Security Profile Scope ---${RESET}"
+        echo ""
+        PS3="${CYAN}Select security profile scope: ${RESET}"
+        scopes=(
+            "Organization level (Recommended)"
+            "Project level"
+        )
+        select scope_choice in "${scopes[@]}"; do
+            case $REPLY in
+                1)
+                    security_profile_scope="organization"
+                    echo "${GREEN}Scope: organization${RESET}"
+                    echo "export TF_VAR_security_profile_scope='organization'" >> .zsecrc
+                    break
+                    ;;
+                2)
+                    security_profile_scope="project"
+                    echo "${GREEN}Scope: project${RESET}"
+                    echo "export TF_VAR_security_profile_scope='project'" >> .zsecrc
+                    break
+                    ;;
+                *)
+                    echo "${RED}Invalid selection. Enter 1 or 2${RESET}"
+                    ;;
+            esac
+        done
+        echo ""
+
+        # --- GCP Consumer Project ---
+        echo "${YELLOW}--- GCP Consumer Project ---${RESET}"
+        echo ""
+
+        while [ -z "$project_id" ]; do
+            read -r -p "${CYAN}Enter GCP project ID: ${RESET}" project_id
+        done
+        echo "export TF_VAR_project_id='$project_id'" >> .zsecrc
+
+        if [[ "$security_profile_scope" == "organization" ]]; then
+            while [ -z "$organization_id" ]; do
+                read -r -p "${CYAN}Enter GCP organization ID: ${RESET}" organization_id
+            done
+            echo "export TF_VAR_organization_id='$organization_id'" >> .zsecrc
+        fi
+
+        billing_default="$project_id"
+        read -r -p "${CYAN}Enter billing project ID [Default=$billing_default]: ${RESET}" billing_input
+        billing_project_id=${billing_input:-$billing_default}
+        echo "export TF_VAR_billing_project_id='$billing_project_id'" >> .zsecrc
+
+        while [ -z "$consumer_network" ]; do
+            read -r -p "${CYAN}Enter existing consumer VPC network name: ${RESET}" consumer_network
+        done
+        echo "export TF_VAR_consumer_network='$consumer_network'" >> .zsecrc
+
+        deploy_key_default="ztgw-nsi"
+        read -r -p "${CYAN}Enter naming prefix for consumer resources [Default=$deploy_key_default]: ${RESET}" deploy_key_input
+        deploy_key=${deploy_key_input:-$deploy_key_default}
+        echo "export TF_VAR_deploy_key='$deploy_key'" >> .zsecrc
+        echo ""
+
+        # --- Firewall Policy Rules ---
+        echo "${YELLOW}--- Firewall Policy Rules ---${RESET}"
+        echo ""
+
+        ingress_default="10.1.0.0/16"
+        read -r -p "${CYAN}Enter ingress source CIDR ranges for inspection [Default=$ingress_default]: ${RESET}" ingress_input
+        ingress_source_ranges=${ingress_input:-$ingress_default}
+        echo "export TF_VAR_ingress_source_ranges='[\"$ingress_source_ranges\"]'" >> .zsecrc
+
+        egress_default="0.0.0.0/0"
+        read -r -p "${CYAN}Enter egress destination CIDR ranges for inspection [Default=$egress_default]: ${RESET}" egress_input
+        egress_destination_ranges=${egress_input:-$egress_default}
+        echo "export TF_VAR_egress_destination_ranges='[\"$egress_destination_ranges\"]'" >> .zsecrc
+
+        allow_default="34.117.59.81/32"
+        read -r -p "${CYAN}Enter ingress source CIDRs to bypass inspection [Default=$allow_default]: ${RESET}" allow_input
+        allow_ingress_source_ranges=${allow_input:-$allow_default}
+        echo "export TF_VAR_allow_ingress_source_ranges='[\"$allow_ingress_source_ranges\"]'" >> .zsecrc
+
+        fw_logging_default="yes"
+        while true; do
+            read -r -p "${CYAN}Enable firewall rule logging? [Default=$fw_logging_default]: ${RESET}" fw_logging_input
+            fw_logging=${fw_logging_input:-$fw_logging_default}
+            case $fw_logging in
+                yes|y)
+                    echo "export TF_VAR_enable_firewall_logging=true" >> .zsecrc
+                    break
+                    ;;
+                no|n)
+                    echo "export TF_VAR_enable_firewall_logging=false" >> .zsecrc
+                    break
+                    ;;
+                *)
+                    echo "${RED}Invalid response. Please enter yes or no${RESET}"
+                    ;;
+            esac
+        done
+        echo ""
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 8: Add PATH to .zsecrc
+    # -----------------------------------------------------------------------
+    if ! grep -Fxq "export PATH=\${PATH}:\${PWD}/bin" .zsecrc 2>/dev/null; then
+        echo 'export PATH=${PATH}:${PWD}/bin' >> .zsecrc
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 9: Deployment summary
+    # -----------------------------------------------------------------------
+    echo "${GREEN}============================================================${RESET}"
+    echo "${GREEN}               DEPLOYMENT SUMMARY${RESET}"
+    echo "${GREEN}============================================================${RESET}"
+    echo ""
+    if [[ "$deploy_ztgw" == "true" && "$deploy_consumer" == "true" ]]; then
+        echo "  Mode:                 ${GREEN}Full deployment (ZTGW + consumer)${RESET}"
+    elif [[ "$deploy_ztgw" == "true" && "$deploy_consumer" == "false" ]]; then
+        echo "  Mode:                 ${GREEN}ZTGW-only${RESET}"
+    else
+        echo "  Mode:                 ${GREEN}Consumer-only${RESET}"
+    fi
+
+    if [[ "$deploy_ztgw" == "true" ]]; then
+        echo "  Gateway Name:         ${GREEN}$gateway_name${RESET}"
+        echo "  GCP Region:           ${GREEN}$gcp_region${RESET}"
+        echo "  Location Name:        ${GREEN}$location_name${RESET}"
+        echo "  IAM Principal:        ${GREEN}${iam_principal_email:-(none)}${RESET}"
+    fi
+    if [[ "$deploy_ztgw" == "false" ]]; then
+        echo "  Intercept Dep. Group: ${GREEN}$intercept_deployment_group${RESET}"
+    fi
+
+    echo "  Cloud:                ${GREEN}$cloud${RESET}"
+    echo "  Vanity Domain:        ${GREEN}$vanity_domain${RESET}"
+    if [ -n "$login_domain_input" ]; then
+        echo "  Login Domain:         ${GREEN}$login_domain_input${RESET} (override)"
+    fi
+
+    if [[ "$deploy_consumer" == "true" ]]; then
+        echo "  Profile Scope:        ${GREEN}$security_profile_scope${RESET}"
+        echo "  Project ID:           ${GREEN}$project_id${RESET}"
+        if [[ "$security_profile_scope" == "organization" ]]; then
+            echo "  Organization ID:      ${GREEN}$organization_id${RESET}"
+        fi
+        echo "  Billing Project:      ${GREEN}$billing_project_id${RESET}"
+        echo "  Consumer VPC:         ${GREEN}$consumer_network${RESET}"
+        echo "  Deploy Key:           ${GREEN}$deploy_key${RESET}"
+        echo "  Ingress CIDRs:        ${GREEN}$ingress_source_ranges${RESET}"
+        echo "  Egress CIDRs:         ${GREEN}$egress_destination_ranges${RESET}"
+        echo "  Bypass CIDRs:         ${GREEN}$allow_ingress_source_ranges${RESET}"
+        echo "  Firewall Logging:     ${GREEN}$fw_logging${RESET}"
+    fi
+    echo ""
+    echo "${GREEN}============================================================${RESET}"
+    echo ""
+
+    while true; do
+        read -r -p "${CYAN}Proceed with deployment? (yes/no): ${RESET}" proceed
+        case $proceed in
+            yes|y)
+                echo ""
+                break
+                ;;
+            no|n)
+                echo "${YELLOW}Deployment cancelled. Configuration saved in .zsecrc${RESET}"
+                echo "${YELLOW}Re-run './zsec up' to deploy with saved configuration, or delete .zsecrc to start over.${RESET}"
+                exit 0
+                ;;
+            *)
+                echo "${RED}Invalid response. Please enter yes or no${RESET}"
+                ;;
+        esac
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Source configuration
+# ---------------------------------------------------------------------------
+
+if [[ -e ./.zsecrc ]]; then
+    echo "${GREEN}Loading configuration from .zsecrc...${RESET}"
+    . ./.zsecrc
+else
+    if [[ "$oper" == "destroy" ]]; then
+        # Check for archived .zsecrc files
+        latest_archive=$(ls -t .zsecrc-* 2>/dev/null | head -1)
+        if [ -n "$latest_archive" ]; then
+            echo "${YELLOW}.zsecrc not found, but archived config found: ${latest_archive}${RESET}"
+            read -r -p "${CYAN}Use this config for destroy? (yes/no): ${RESET}" use_archive
+            case $use_archive in
+                yes|y)
+                    cp "$latest_archive" .zsecrc
+                    echo "${GREEN}Restored .zsecrc from ${latest_archive}${RESET}"
+                    . ./.zsecrc
+                    ;;
+                *)
+                    echo "${RED}Cannot destroy without configuration. Exiting.${RESET}"
+                    exit 1
+                    ;;
+            esac
+        else
+            echo "${RED}.zsecrc not found. Nothing to destroy or configuration was already cleaned up.${RESET}"
+            exit 1
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Lab mode — re-run from cached .zsecrc
+# ---------------------------------------------------------------------------
+
+if [[ "$LAB_MODE" == "true" ]]; then
+    LAB_TF_DIR="../lab-environment"
+
+    if [[ "$oper" == "up" ]]; then
+        echo "${GREEN}Initializing Terraform (lab-environment)...${RESET}"
+        ./bin/terraform -chdir="$LAB_TF_DIR" init
+
+        echo ""
+        echo "${GREEN}Deploying lab environment...${RESET}"
+
+        if [[ "$AUTO_APPROVE" ]]; then
+            ./bin/terraform -chdir="$LAB_TF_DIR" apply -auto-approve
+        else
+            ./bin/terraform -chdir="$LAB_TF_DIR" apply
+        fi
+
+        echo ""
+        echo "${GREEN}============================================================${RESET}"
+        echo "${GREEN}  Lab Environment deployment complete${RESET}"
+        echo "${GREEN}============================================================${RESET}"
+        echo ""
+        echo "  Run ${CYAN}./bin/terraform -chdir=$LAB_TF_DIR output${RESET} to view all outputs."
+        echo "  Run ${CYAN}./zsec destroy${RESET} to tear down all resources."
+        echo ""
+
+    elif [[ "$oper" == "destroy" ]]; then
+        echo "${YELLOW}============================================================${RESET}"
+        echo "${YELLOW}           LAB ENVIRONMENT DESTROY${RESET}"
+        echo "${YELLOW}============================================================${RESET}"
+        echo ""
+        echo "  The following lab resources will be destroyed:"
+        echo ""
+
+        if [[ "$TF_VAR_deploy_east_west" == "true" ]]; then
+            echo "  ${RED}- VPC-A (vpc-ew-a) + nginx VM${RESET}"
+            echo "  ${RED}- VPC-B (vpc-ew-b) + nginx VM${RESET}"
+            echo "  ${RED}- Bastion VM + SSH key${RESET}"
+            echo "  ${RED}- VPC peering (bi-directional)${RESET}"
+            if [[ "$TF_VAR_deploy_nsi" == "true" ]]; then
+                echo "  ${RED}- NSI consumer resources on VPC-A and VPC-B${RESET}"
+            fi
+        fi
+
+        if [[ "$TF_VAR_deploy_ingress" == "true" ]]; then
+            echo "  ${RED}- Ingress VPC (vpc-ingress) + web server VM${RESET}"
+            echo "  ${RED}- External passthrough NLB${RESET}"
+            if [[ "$TF_VAR_deploy_nsi" == "true" ]]; then
+                echo "  ${RED}- NSI consumer resources on ingress VPC${RESET}"
+            fi
+        fi
+
+        if [[ "$TF_VAR_deploy_east_west" != "true" && "$TF_VAR_deploy_ingress" != "true" ]]; then
+            echo "  ${RED}- Bastion VM + SSH key${RESET}"
+        fi
+
+        echo ""
+        echo "${YELLOW}============================================================${RESET}"
+        echo ""
+
+        if [[ ! "$AUTO_APPROVE" ]]; then
+            while true; do
+                read -r -p "${CYAN}Are you sure you want to destroy all lab resources? (yes/no): ${RESET}" confirm_destroy
+                case $confirm_destroy in
+                    yes|y)
+                        echo ""
+                        break
+                        ;;
+                    no|n)
+                        echo "${GREEN}Destroy cancelled.${RESET}"
+                        exit 0
+                        ;;
+                    *)
+                        echo "${RED}Invalid response. Please enter yes or no${RESET}"
+                        ;;
+                esac
+            done
+        fi
+
+        echo "${YELLOW}--- Destroying lab environment GCP resources ---${RESET}"
+        ./bin/terraform -chdir="$LAB_TF_DIR" init
+
+        if [[ "$AUTO_APPROVE" ]]; then
+            ./bin/terraform -chdir="$LAB_TF_DIR" destroy -auto-approve
+        else
+            ./bin/terraform -chdir="$LAB_TF_DIR" destroy
+        fi
+
+        echo ""
+        echo "${YELLOW}Cleaning up local state and files...${RESET}"
+        rm -rf "$LAB_TF_DIR/.terraform"
+        rm -f "$LAB_TF_DIR/.terraform.lock.hcl"
+        rm -f "$LAB_TF_DIR/terraform.tfstate"*
+        rm -f "$LAB_TF_DIR/lab-key.pem"
+        rm -rf bin
+
+        now=$(date +'%Y-%m-%d-%H_%M_%S')
+        echo "Archiving .zsecrc to .zsecrc-${now}"
+        cp .zsecrc ".zsecrc-${now}"
+        rm -f .zsecrc .zsecrc.bak
+
+        echo ""
+        echo "${GREEN}============================================================${RESET}"
+        echo "${GREEN}  Lab destroy complete. All resources and state cleaned up.${RESET}"
+        echo "${GREEN}============================================================${RESET}"
+        echo ""
+        echo "  Archived config: ${CYAN}.zsecrc-${now}${RESET}"
+        echo "  To redeploy, run ${CYAN}./zsec up${RESET}"
+        echo ""
+    fi
+
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Validate required variables (ZTGW/consumer modes only)
+# ---------------------------------------------------------------------------
+
+if [ -z "$TF_VAR_client_id" ] || [ -z "$TF_VAR_client_secret" ] || [ -z "$TF_VAR_vanity_domain" ]; then
+    echo "${RED}Zscaler OneAPI credentials are missing. Delete .zsecrc and re-run './zsec up'${RESET}"
+    exit 1
+fi
+
+if [[ "$TF_VAR_deploy_consumer" != "false" ]]; then
+    if [ -z "$TF_VAR_project_id" ] || [ -z "$TF_VAR_consumer_network" ]; then
+        echo "${RED}GCP project or consumer network is missing. Delete .zsecrc and re-run './zsec up'${RESET}"
+        exit 1
+    fi
+fi
+
+if [[ "$TF_VAR_deploy_ztgw" == "false" && -z "$TF_VAR_intercept_deployment_group" ]]; then
+    echo "${RED}Consumer-only mode requires intercept_deployment_group. Delete .zsecrc and re-run './zsec up'${RESET}"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Terraform operations (ZTGW/consumer modes only)
+# ---------------------------------------------------------------------------
+
+if [[ "$oper" == "up" ]]; then
+    echo "${GREEN}Initializing Terraform...${RESET}"
+    ./bin/terraform init
+
+    echo ""
+    if [[ "$TF_VAR_deploy_consumer" == "false" ]]; then
+        echo "${GREEN}Deploying GCP ZTGW...${RESET}"
+    elif [[ "$TF_VAR_deploy_ztgw" == "false" ]]; then
+        echo "${GREEN}Deploying consumer NSI resources...${RESET}"
+    else
+        echo "${GREEN}Deploying GCP ZTGW + consumer NSI resources...${RESET}"
+    fi
+
+    if [[ "$AUTO_APPROVE" ]]; then
+        ./bin/terraform apply -auto-approve
+    else
+        ./bin/terraform apply
+    fi
+
+    echo ""
+    echo "${GREEN}============================================================${RESET}"
+    echo "${GREEN}  Deployment complete${RESET}"
+    echo "${GREEN}============================================================${RESET}"
+    echo ""
+    echo "  Run ${CYAN}./bin/terraform output${RESET} to view all outputs."
+    echo "  Run ${CYAN}./zsec destroy${RESET} to tear down all resources."
+    echo ""
+
+elif [[ "$oper" == "destroy" ]]; then
+    echo "${YELLOW}============================================================${RESET}"
+    echo "${YELLOW}               DESTROY SUMMARY${RESET}"
+    echo "${YELLOW}============================================================${RESET}"
+    echo ""
+    echo "  The following resources will be destroyed:"
+    echo ""
+    if [[ "$TF_VAR_deploy_ztgw" == "true" ]]; then
+        echo "  ${RED}- ZTGW '${TF_VAR_gateway_name}' from Zscaler${RESET}"
+    fi
+    if [[ "$TF_VAR_deploy_consumer" != "false" ]]; then
+        echo "  ${RED}- Consumer-side GCP resources (firewall policy, endpoint group, security profiles, firewall rules)${RESET}"
+    fi
+    echo ""
+    echo "${YELLOW}============================================================${RESET}"
+    echo ""
+
+    if [[ ! "$AUTO_APPROVE" ]]; then
+        while true; do
+            read -r -p "${CYAN}Are you sure you want to destroy all resources? (yes/no): ${RESET}" confirm_destroy
+            case $confirm_destroy in
+                yes|y)
+                    echo ""
+                    break
+                    ;;
+                no|n)
+                    echo "${GREEN}Destroy cancelled.${RESET}"
+                    exit 0
+                    ;;
+                *)
+                    echo "${RED}Invalid response. Please enter yes or no${RESET}"
+                    ;;
+            esac
+        done
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 1: Delete ZTGW from Zscaler (if deployed via zsec)
+    # -----------------------------------------------------------------------
+    if [[ "$TF_VAR_deploy_ztgw" == "true" ]]; then
+        echo "${YELLOW}--- Deleting ZTGW from Zscaler ---${RESET}"
+        bash "$(dirname "$0")/scripts/destroy_ztgw.sh" || true
+        echo ""
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 2: Destroy consumer-side GCP resources via Terraform (if deployed)
+    # -----------------------------------------------------------------------
+    if [[ "$TF_VAR_deploy_consumer" != "false" ]]; then
+        echo "${YELLOW}--- Destroying consumer-side GCP resources ---${RESET}"
+        ./bin/terraform init
+
+        if [[ "$AUTO_APPROVE" ]]; then
+            ./bin/terraform destroy -auto-approve
+        else
+            ./bin/terraform destroy
+        fi
+    else
+        echo "${YELLOW}No consumer resources to destroy (ZTGW-only mode).${RESET}"
+    fi
+
+    echo ""
+    echo "${YELLOW}Cleaning up local state and files...${RESET}"
+    rm -rf .terraform*
+    rm -f terraform.tfstate*
+    rm -f tfplan
+    rm -rf bin
+
+    now=$(date +'%Y-%m-%d-%H_%M_%S')
+    echo "Archiving .zsecrc to .zsecrc-${now}"
+    cp .zsecrc ".zsecrc-${now}"
+    rm -f .zsecrc .zsecrc.bak
+
+    echo ""
+    echo "${GREEN}============================================================${RESET}"
+    echo "${GREEN}  Destroy complete. All resources and state cleaned up.${RESET}"
+    echo "${GREEN}============================================================${RESET}"
+    echo ""
+    echo "  Archived config: ${CYAN}.zsecrc-${now}${RESET}"
+    echo "  To redeploy, run ${CYAN}./zsec up${RESET}"
+    echo ""
+fi

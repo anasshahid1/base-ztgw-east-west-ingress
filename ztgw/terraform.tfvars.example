@@ -1,0 +1,80 @@
+# =============================================================================
+# Deployment Mode
+# =============================================================================
+
+# Set to false to skip ZTGW deployment and use an existing intercept
+# deployment group (you must then set intercept_deployment_group below).
+# deploy_ztgw = true
+
+# =============================================================================
+# Zscaler OneAPI Authentication (required when deploy_ztgw = true)
+# =============================================================================
+
+# client_id     = "<your-client-id>"
+# client_secret = "<your-client-secret>"
+# vanity_domain = "<your-vanity-domain>"
+# cloud         = "zscaler"
+# Cloud values: zscaler, zscalerone, zscalertwo, zscalerthree, zscalerbeta
+
+# =============================================================================
+# GCP ZTGW (used when deploy_ztgw = true)
+# =============================================================================
+
+# gateway_name        = "gcp-ztgw-demo"
+# gcp_region          = "us-central1"
+# location_name       = "gcp-ztgw-demo-location"
+# iam_principal_email = "user@example.com"
+
+# =============================================================================
+# Intercept Deployment Group (used when deploy_ztgw = false)
+# =============================================================================
+
+# When deploy_ztgw = true, this value is auto-wired from the ZTGW output.
+# When deploy_ztgw = false, you must provide the existing deployment group ID.
+# intercept_deployment_group = "projects/zscaler-producer-project/locations/global/interceptDeploymentGroups/ztgw-deployment-group"
+
+# =============================================================================
+# Security Profile Scope
+# =============================================================================
+
+# security_profile_scope = "project"
+# Options: "project" (default) or "organization"
+
+# =============================================================================
+# GCP Consumer Project
+# =============================================================================
+
+# project_id         = "my-gcp-project"
+# organization_id    = "123456789012"
+# billing_project_id = "my-gcp-project"
+# region             = "us-central1"
+# location           = "global"
+# consumer_network   = "my-vpc-network"
+
+# =============================================================================
+# Naming
+# =============================================================================
+
+# deploy_key = "ztgw-nsi"
+
+# Optional resource name overrides (leave blank to auto-generate from deploy_key):
+# consumer_fw_policy             = ""
+# consumer_fw_policy_association = ""
+# endpoint_group                 = ""
+# endpoint_group_association     = ""
+# security_profile               = ""
+# security_profile_group         = ""
+
+# =============================================================================
+# Firewall Policy Rules
+# =============================================================================
+
+# ingress_rule_priority       = 100
+# allow_ingress_rule_priority = 90
+# egress_rule_priority        = 101
+
+# ingress_source_ranges       = ["10.1.0.0/16"]
+# allow_ingress_source_ranges = ["34.117.59.81/32"]
+# egress_destination_ranges   = ["0.0.0.0/0"]
+
+# enable_firewall_logging = true

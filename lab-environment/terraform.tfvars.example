@@ -1,0 +1,76 @@
+# =============================================================================
+# GCP ZTGW Lab Environment — Example tfvars
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in the values.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# GCP Project / Region
+# ---------------------------------------------------------------------------
+
+project_id = "your-gcp-project-id"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# Required only when security_profile_scope = "organization"
+# organization_id = "your-org-id"
+
+# ---------------------------------------------------------------------------
+# Lab Scenario Toggles
+# ---------------------------------------------------------------------------
+# Enable/disable scenarios independently.
+# east-west = two VPCs, nginx VMs, bastion, VPC peering
+# ingress   = one VPC, web server, external passthrough NLB
+
+deploy_east_west = true
+deploy_ingress   = true
+
+# ---------------------------------------------------------------------------
+# Naming prefix (all resources will be prefixed with this)
+# ---------------------------------------------------------------------------
+
+deploy_key = "ztgw-lab"
+
+# ---------------------------------------------------------------------------
+# VM Configuration
+# ---------------------------------------------------------------------------
+
+machine_type = "e2-small"
+
+# ---------------------------------------------------------------------------
+# VPC-A — East-West (10.1.0.0/16)
+# ---------------------------------------------------------------------------
+
+vpc_a_name        = "vpc-ew-a"
+vpc_a_cidr        = "10.1.0.0/16"
+vpc_a_subnet_cidr = "10.1.1.0/24"
+
+# ---------------------------------------------------------------------------
+# VPC-B — East-West (192.168.0.0/16)
+# ---------------------------------------------------------------------------
+
+vpc_b_name        = "vpc-ew-b"
+vpc_b_cidr        = "192.168.0.0/16"
+vpc_b_subnet_cidr = "192.168.1.0/24"
+
+# ---------------------------------------------------------------------------
+# Ingress VPC (172.16.0.0/16)
+# ---------------------------------------------------------------------------
+
+ingress_vpc_name        = "vpc-ingress"
+ingress_vpc_cidr        = "172.16.0.0/16"
+ingress_vpc_subnet_cidr = "172.16.1.0/24"
+
+# ---------------------------------------------------------------------------
+# NSI Configuration
+# ---------------------------------------------------------------------------
+
+# Set to true once you have a ZTGW deployed and an intercept_deployment_group
+deploy_nsi = false
+
+# Fill in after ZTGW is deployed:
+# intercept_deployment_group = "projects/<producer-project>/locations/global/interceptDeploymentGroups/<group-name>"
+
+# Security profile scope: "project" (default) or "organization"
+security_profile_scope = "project"
+nsi_location           = "global"
